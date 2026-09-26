@@ -357,7 +357,7 @@ class ExternalAttempts:
         # Cancellation may overtake a worker's durably pending message. Consume
         # only authenticated, fenced, schema-valid next messages; never grant work.
         cancelled = attempt['state'] == 'cancel_requested' and msg['kind'] in (
-            'accept', 'start', 'heartbeat', 'progress', 'blocked', 'result')
+            'accept', 'start', 'heartbeat', 'progress', 'blocked', 'result', 'yield')
         state = 'cancel_requested' if cancelled else TRANSITIONS.get((attempt['state'], msg['kind']))
         if state is None or msg['sequence'] != attempt['sequence'] + 1:
             raise ProtocolError('invalid transition or sequence')

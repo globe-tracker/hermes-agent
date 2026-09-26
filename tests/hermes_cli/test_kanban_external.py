@@ -257,7 +257,7 @@ def test_external_completion_contract_fails_closed(setup, phase):
     assert _durable_state(conn) == before
 
 
-@pytest.mark.parametrize('kind', ['accept', 'start', 'heartbeat', 'progress', 'blocked', 'result'])
+@pytest.mark.parametrize('kind', ['accept', 'start', 'heartbeat', 'progress', 'blocked', 'result', 'yield'])
 def test_cancel_overtakes_message_without_execution_and_replays_after_restart(setup, kind):
     import json
     from concurrent.futures import ThreadPoolExecutor
@@ -272,6 +272,7 @@ def test_cancel_overtakes_message_without_execution_and_replays_after_restart(se
         api.receive(message(api, key, assignment, sequence, 'start'))
         sequence += 1
     payload = {'progress': {'checkpoint': 'progress'}, 'blocked': {'checkpoint': 'blocked'},
+               'yield': {'checkpoint': 'stopped', 'tools_returned': True, 'in_flight_operations': []},
                'result': _result_payload()}.get(kind)
     pending = message(api, key, assignment, sequence, kind, payload)
     api.cancel(tid, reason='fixture-stop')

@@ -56,7 +56,7 @@ by older versions, leaving task/attempt ownership unchanged for reconciliation.
 ## Cancellation racing with pending messages
 
 If cancellation commits first, a valid next-sequence `accept`, `start`,
-`heartbeat`, `progress`, `blocked` or `result` is consumed atomically with a
+`heartbeat`, `progress`, `blocked`, `result` or `yield` is consumed atomically with a
 receipt/outbox entry and an `external_message_rejected` event. The receipt has
 `outcome=rejected`, `rejection_reason=cancel_requested`, and
 `state=cancel_requested`. All existing identity/sequence bindings and the SHA-256
@@ -78,8 +78,14 @@ operational/storage failures are not permanent rejections and must remain retrya
 
 If the worker message committed first, exact retry returns its original accepted
 receipt (the absence of `outcome` retains the v1 accepted meaning), not a later
-rejection. A committed result remains in Review and cannot be overwritten by
-cancellation. Rejected receipts likewise replay unchanged after reconnect, later
+rejection. A committed result remains in Review; a committed yield remains
+Yielded. Neither can be overwritten by cancellation. If cancellation wins over
+yield, its shutdown declaration is still validated but the rejection does not
+release ownership: a separate next-sequence `cancel_ack` with a valid shutdown
+declaration is required. `cancel_ack` is never a rejection-receipt kind: it is
+accepted only in `cancel_requested`, and its exact receipt replays after cancellation
+settles. A second cancellation of a requested/terminal attempt fails closed.
+Rejected receipts likewise replay unchanged after reconnect, later
 `cancel_ack`, or uncertain delivery, provided current identity/fences still pass.
 Revocation/expiry rejects even previously committed receipts. Receipt/outbox failure
 rolls back sequence, event and receipt together; no blind pending-message discard
@@ -96,7 +102,9 @@ Use the repository's isolated runner, never a safety-environment bypass. The tes
 use generated keys and temporary native databases, cover auth/replay,
 revocation/expiry, tenant/home isolation, local-dispatch exclusion, cancellation,
 fencing, rollback and concurrent duplicate receipt serialization. Cancellation
-coverage includes each overtaken kind, no execution mutation, dependency drift,
+coverage derives a both-orderings matrix from every supported transition (including
+all yield source states and `cancel_ack`), plus shutdown-declaration rejection,
+no execution mutation, dependency drift,
 reconnect/duplicate replay, publication failure rollback, next-sequence stop
 acknowledgement and negative authentication/schema/fence cases. The broader
 Kanban suite also exercises legacy migrations and local execution compatibility.
