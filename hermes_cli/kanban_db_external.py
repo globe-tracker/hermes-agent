@@ -103,6 +103,24 @@ def require_local_task(conn, task_id):
         raise ProtocolError('external task requires external-attempt API')
 
 
+def require_deletable_task(conn, task_id):
+    """Check under the delete transaction; external dependency edges are frozen."""
+    require_local_task(conn, task_id)
+    if conn.execute(
+        "SELECT 1 FROM task_links l JOIN tasks c ON c.id=l.child_id "
+        "WHERE l.parent_id=? AND c.execution_backend!='local_profile' LIMIT 1",
+        (task_id,),
+    ).fetchone():
+        raise ProtocolError('task has external dependents; deletion requires reconciliation')
+
+
+def _require_supported_completion_contract(task):
+    # PR acceptance is tied to local run/publication evidence, which wire v1
+    # cannot provide. Operator review text is not a substitute for that gate.
+    if task['completion_contract'] not in (None, '', 'local-only'):
+        raise ProtocolError('external execution does not support this completion contract')
+
+
 def initialize_schema(conn):
     """Additive migration; called only by the normal native connection initializer."""
     statements = (
@@ -223,6 +241,7 @@ class ExternalAttempts:
                 raise ProtocolError('task not eligible for external preparation')
             if task['claim_lock'] or task['worker_pid'] or task['workflow_template_id']:
                 raise ProtocolError('task has local execution context')
+            _require_supported_completion_contract(task)
             self.conn.execute('INSERT INTO external_tasks VALUES (?, ?, ?, ?)',
                               (task_id, self.tenant, canonical(scope).decode(), canonical(capabilities).decode()))
             self.conn.execute("UPDATE tasks SET execution_backend='external_agent', assignee=NULL, status='ready', external_revision=1 WHERE id=?", (task_id,))
@@ -416,6 +435,8 @@ class ExternalAttempts:
             if not attempt or attempt['epoch'] != self.epoch or task['external_attempt_id'] != attempt_id or task['external_state'] != 'review' or reviewer == attempt['agent_id']:
                 raise ProtocolError('review fence mismatch')
             self._check_dependencies(task_id)
+            # Also fence already-prepared databases from older API versions.
+            _require_supported_completion_contract(task)
             self.conn.execute("UPDATE tasks SET status='done', external_state='done', completed_at=? WHERE id=?", (int(time.time()), task_id))
             self.conn.execute("UPDATE external_attempts SET state='done' WHERE attempt_id=?", (attempt_id,))
             self._event(task_id, 'external_reviewed', {'attempt_id': attempt_id, 'reviewer': reviewer, 'evidence': evidence})

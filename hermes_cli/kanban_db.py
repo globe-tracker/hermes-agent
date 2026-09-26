@@ -3994,10 +3994,10 @@ def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
 def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete an ARCHIVED task (+ related rows); anything else must be
     archived first so data loss takes two deliberate actions."""
-    from hermes_cli.kanban_db_external import require_local_task
+    from hermes_cli.kanban_db_external import require_deletable_task, require_local_task
     require_local_task(conn, task_id)
     with write_txn(conn):
-        require_local_task(conn, task_id)
+        require_deletable_task(conn, task_id)
         if _task_status(conn, task_id) != "archived":
             return False
         _delete_task_relations(conn, task_id)
@@ -4007,10 +4007,10 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete a task and its related rows in one txn; False when not found."""
-    from hermes_cli.kanban_db_external import require_local_task
+    from hermes_cli.kanban_db_external import require_deletable_task, require_local_task
     require_local_task(conn, task_id)
     with write_txn(conn):
-        require_local_task(conn, task_id)
+        require_deletable_task(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False

@@ -167,3 +167,91 @@ def test_independent_connections_serialize_duplicate_receive(setup):
     assert receipts[0] == receipts[1]
     assert conn.execute('SELECT count(*) FROM external_receipts').fetchone()[0] == 1
     assert kb.get_task(conn, tid).external_state == 'accepted'
+
+
+def _durable_state(conn):
+    tables = ('tasks', 'task_links', 'task_runs', 'task_comments', 'task_events',
+              'external_tasks', 'external_attempts', 'external_receipts', 'external_outbox')
+    return {table: [tuple(row) for row in conn.execute(f'SELECT * FROM {table} ORDER BY rowid')]
+            for table in tables}
+
+
+def _result_payload():
+    return {'criteria': [{'criterion': 'fixture', 'evidence': 'fixture evidence'}],
+            'tests': ['fixture passed'], 'artifacts': ['fixture artifact'], 'risks': [],
+            'checkpoint': 'finished', 'tools_returned': True, 'in_flight_operations': []}
+
+
+@pytest.mark.parametrize('delete', [kb.delete_task, kb.delete_archived_task])
+@pytest.mark.parametrize('phase', ['offer', 'start', 'review'])
+def test_delete_preserves_external_prerequisite(setup, delete, phase):
+    conn, api, key, _, _ = setup
+    parent = kb.create_task(conn, title='local prerequisite', tenant='test-tenant')
+    if phase != 'offer':
+        assert kb.complete_task(conn, parent, result='accepted fixture')
+    child = kb.create_task(conn, title='external dependent', tenant='test-tenant', parents=[parent])
+    api.prepare_task(child, scope={'fixture': True}, capabilities=['test'])
+    if phase != 'offer':
+        assignment = api.offer(child, 'worker', 'dependent-offer', authorization_ref='fixture')
+        api.receive(message(api, key, assignment, 1, 'accept'))
+        if phase == 'review':
+            api.receive(message(api, key, assignment, 2, 'start'))
+            api.receive(message(api, key, assignment, 3, 'result', _result_payload()))
+    assert kb.archive_task(conn, parent)
+    before = _durable_state(conn)
+    with pytest.raises(ProtocolError, match='external depend'):
+        delete(conn, parent)
+    assert _durable_state(conn) == before
+    with pytest.raises(ProtocolError, match='dependencies not accepted'):
+        if phase == 'offer':
+            api.offer(child, 'worker', 'dependent-offer', authorization_ref='fixture')
+        elif phase == 'start':
+            api.receive(message(api, key, assignment, 2, 'start'))
+        else:
+            api.review(child, assignment['attempt_id'], reviewer='independent', evidence='fixture')
+    assert _durable_state(conn) == before
+
+
+@pytest.mark.parametrize('entry', ['swarm', 'inline'])
+def test_swarm_cannot_activate_cancel_requested_external_root(setup, entry):
+    from hermes_cli import kanban_swarm as swarm
+    conn, api, _, _, _ = setup
+    root = kb.create_task(conn, title='external root', tenant='test-tenant', idempotency_key='swarm-key')
+    api.prepare_task(root, scope={'fixture': True}, capabilities=['test'])
+    api.offer(root, 'worker', 'root-offer', authorization_ref='fixture')
+    api.cancel(root, reason='fixture-stop')
+    before = _durable_state(conn)
+    with pytest.raises(ProtocolError, match='external task'):
+        if entry == 'swarm':
+            swarm.create_swarm(conn, goal='fixture',
+                               workers=[swarm.SwarmWorkerSpec('local', 'worker', 'fixture')],
+                               verifier_assignee='verifier', synthesizer_assignee='synthesizer',
+                               tenant='test-tenant', idempotency_key='swarm-key')
+        else:
+            with kb.write_txn(conn):
+                swarm._activate_root_inline(conn, root, summary='fixture', metadata={})
+    assert _durable_state(conn) == before
+
+
+@pytest.mark.parametrize('phase', ['prepare', 'review'])
+def test_external_completion_contract_fails_closed(setup, phase):
+    conn, api, key, tid, assignment = setup
+    contract = 'https://github.com/fixture/repository/pull/1'
+    if phase == 'prepare':
+        tid = kb.create_task(conn, title='contract fixture', tenant='test-tenant', completion_contract=contract)
+    else:
+        api.receive(message(api, key, assignment, 1, 'accept'))
+        api.receive(message(api, key, assignment, 2, 'start'))
+        api.receive(message(api, key, assignment, 3, 'result', _result_payload()))
+        # Model a DB prepared by the older API, which admitted these contracts.
+        # No network acceptance lookup is needed: unsupported contracts fail closed.
+        with kb.write_txn(conn):
+            conn.execute('UPDATE tasks SET completion_contract=? WHERE id=?', (contract, tid))
+    before = _durable_state(conn)
+    with pytest.raises(ProtocolError, match='completion contract'):
+        if phase == 'prepare':
+            api.prepare_task(tid, scope={'fixture': True}, capabilities=['test'])
+        else:
+            api.review(tid, assignment['attempt_id'], reviewer='independent', evidence='cannot replace acceptance')
+    assert kb.get_task(conn, tid).status != 'done'
+    assert _durable_state(conn) == before

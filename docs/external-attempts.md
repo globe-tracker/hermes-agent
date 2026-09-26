@@ -42,6 +42,17 @@ external tasks never acquire fake PIDs. Board transfer is refused for boards wit
 external tasks. `rotate_epoch` invalidates old messages and holds unresolved work;
 restore requires coherent DB/outbox/journal recovery and explicit reconciliation.
 
+External dependency edges are frozen: both hard-delete APIs refuse to delete a
+local prerequisite of an external task, including an archived prerequisite.
+Archival is not accepted completion; offer, start, result and review still require
+Done parents. No reconciliation/removal API is supplied in v1. Swarm idempotency
+cannot reuse an external task as a local planning root or synthesize a local run.
+
+Wire v1 supports only unset or `local-only` completion contracts. `prepare_task`
+rejects PR/repository contracts rather than substituting reviewer prose for the
+native PR acceptance gate. `review` also rejects these contracts on tasks prepared
+by older versions, leaving task/attempt ownership unchanged for reconciliation.
+
 ## Verification
 
 Run the repository test runner against `tests/hermes_cli/test_kanban_external.py`.
