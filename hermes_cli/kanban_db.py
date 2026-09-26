@@ -731,6 +731,10 @@ class Task:
     # VALID_BLOCK_KINDS or None (legacy); kept across unblock so a same-kind re-block reads as a loop.
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
+    execution_backend: str = "local_profile"
+    external_attempt_id: Optional[str] = None
+    external_state: Optional[str] = None
+    external_revision: int = 0
     completion_contract: Optional[str] = None
 
     @classmethod
@@ -749,6 +753,10 @@ class Task:
             skills=skills_value,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
+            execution_backend=g("execution_backend", "local_profile"),
+            external_attempt_id=g("external_attempt_id"),
+            external_state=g("external_state"),
+            external_revision=int(g("external_revision", 0)),
         )
 
 
@@ -1546,8 +1554,11 @@ def list_tasks(
 
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
     """Assign/reassign; raises RuntimeError while the task is running under a claim."""
+    from hermes_cli.kanban_db_external import require_local_task
+    require_local_task(conn, task_id)
     profile = _canonical_assignee(profile)
     with write_txn(conn):
+        require_local_task(conn, task_id)
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -1597,7 +1608,10 @@ def _set_task_override(
 ) -> bool:
     """Per-task override write: refuse archived tasks, record ``event_kind``,
     then fire the task-updated observer AFTER commit (RFC #58548)."""
+    from hermes_cli.kanban_db_external import require_local_task
+    require_local_task(conn, task_id)
     with write_txn(conn):
+        require_local_task(conn, task_id)
         status = _task_status(conn, task_id)
         if status is None:
             return False
@@ -1643,6 +1657,8 @@ def link_tasks(
         raise ValueError("a task cannot depend on itself")
     gated = False
     with write_txn(conn):
+        from hermes_cli.kanban_db_external import require_local_task
+        require_local_task(conn, child_id)
         missing = _missing_task_ids(conn, [parent_id, child_id])
         if missing:
             raise ValueError(f"unknown task(s): {', '.join(missing)}")
@@ -1702,6 +1718,8 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
 
 def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
     with write_txn(conn):
+        from hermes_cli.kanban_db_external import require_local_task
+        require_local_task(conn, child_id)
         cur = conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?", (parent_id, child_id),
         )
@@ -2143,7 +2161,7 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
     with write_txn(conn):
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
+            "FROM tasks WHERE status IN ('todo', 'blocked') AND execution_backend = 'local_profile'"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
@@ -2229,6 +2247,7 @@ def _claim_and_open_run(
          WHERE id = ?
            AND status = '{source_status}'
            AND claim_lock IS NULL
+           AND execution_backend = 'local_profile'
         """,
         (lock, expires, now, task_id),
     )
@@ -2273,6 +2292,9 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        candidate = get_task(conn, task_id)
+        if candidate and candidate.execution_backend != 'local_profile':
+            return None
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.
@@ -2306,6 +2328,9 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        candidate = get_task(conn, task_id)
+        if candidate and candidate.execution_backend != 'local_profile':
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -2385,9 +2410,12 @@ def heartbeat_claim(
     claimer: Optional[str] = None,
 ) -> bool:
     """Extend a running claim; True if we still own it."""
+    from hermes_cli.kanban_db_external import require_local_task
+    require_local_task(conn, task_id)
     expires = int(time.time()) + _resolve_claim_ttl_seconds(ttl_seconds)
     lock = claimer or _claimer_id()
     with write_txn(conn):
+        require_local_task(conn, task_id)
         cur = conn.execute(
             "UPDATE tasks SET claim_expires = ? "
             "WHERE id = ? AND status = 'running' AND claim_lock = ?", (expires, task_id, lock),
@@ -2442,7 +2470,7 @@ def release_stale_claims(
         "SELECT id, claim_lock, worker_pid, worker_started_at, claim_expires, last_heartbeat_at, "
         "       assignee "
         "FROM tasks "
-        "WHERE status = 'running' AND claim_expires IS NOT NULL "
+        "WHERE status = 'running' AND execution_backend = 'local_profile' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?", (now,),
     ).fetchall()
     for row in stale:
@@ -2560,6 +2588,8 @@ def reclaim_task(
 ) -> bool:
     """Operator reclaim regardless of TTL: release the claim, restore the source
     phase, reset the failure counter. False when not running."""
+    from hermes_cli.kanban_db_external import require_local_task
+    require_local_task(conn, task_id)
     row = conn.execute(
         "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
@@ -2572,6 +2602,7 @@ def reclaim_task(
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn, started_at=row["worker_started_at"])
     with write_txn(conn):
+        require_local_task(conn, task_id)
         retry_status = _retry_status_for_run(conn, task_id)
         cur = conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -2743,6 +2774,8 @@ def complete_task(
     whitespace-only evidence raises :class:`EmptyCompletionError` after an
     auditable event. Approving a card out of ``review`` stays exempt.
     """
+    from hermes_cli.kanban_db_external import require_local_task
+    require_local_task(conn, task_id)
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -2758,6 +2791,7 @@ def complete_task(
     if acceptance is False:
         return False
     with write_txn(conn):
+        require_local_task(conn, task_id)
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
@@ -3135,11 +3169,14 @@ def edit_task(
     metadata: Optional[dict] = None, board: Optional[str] = None,
 ) -> bool:
     """Edit task fields, optionally backfilling a completed task's result."""
+    from hermes_cli.kanban_db_external import require_local_task
+    require_local_task(conn, task_id)
     changed_fields = [
         field for field, value in (("title", title), ("body", body), ("priority", priority))
         if value is not None
     ]
     with write_txn(conn):
+        require_local_task(conn, task_id)
         status = _task_status(conn, task_id)
         if status is None or (result is not None and status != "done"):
             return False
@@ -3223,9 +3260,12 @@ def block_task(
     runs stay exactly as the breaker left them. A typed block, a card with a
     live run, or a kind-less call on a blocked card are still refused.
     """
+    from hermes_cli.kanban_db_external import require_local_task
+    require_local_task(conn, task_id)
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
     with write_txn(conn):
+        require_local_task(conn, task_id)
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
@@ -3366,6 +3406,8 @@ def request_review(
     task stays ``running`` and retryable, with no attachments and no event.
     """
 
+    from hermes_cli.kanban_db_external import require_local_task
+    require_local_task(conn, task_id)
     def _ret(ok: bool, reason: Optional[str] = None):
         return (ok, reason) if with_reason else ok
 
@@ -3381,6 +3423,7 @@ def request_review(
     staged_copies: list[Path] = []
     try:
         with write_txn(conn):
+            require_local_task(conn, task_id)
             if not _parents_satisfied(conn, task_id):
                 return _ret(False, "parent dependencies are not satisfied")
             trow = conn.execute(
@@ -3498,11 +3541,14 @@ def request_changes(
     """Close an active reviewer run (claimed from ``review``) and hand the task
     back to the implementer from the latest ``review_requested`` event, parent
     gating reapplied. Returns ``(ok, implementer | reason)``."""
+    from hermes_cli.kanban_db_external import require_local_task
+    require_local_task(conn, task_id)
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
 
     with write_txn(conn):
+        require_local_task(conn, task_id)
         task_row = conn.execute(
             "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
@@ -3569,6 +3615,8 @@ def promote_task(
     """Operator promotion ``todo``/``blocked`` -> ``ready`` with an audit event.
     Refused while a parent is unfinished; ``dry_run`` only validates.
     Returns ``(ok, reason)``."""
+    from hermes_cli.kanban_db_external import require_local_task
+    require_local_task(conn, task_id)
     cur_status = _task_status(conn, task_id)
     if cur_status is None:
         return False, f"task {task_id} not found"
@@ -3600,6 +3648,7 @@ def promote_task(
         return True, None
 
     with write_txn(conn):
+        require_local_task(conn, task_id)
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
             "WHERE id = ? AND status IN ('todo', 'blocked')", (task_id,),
@@ -3644,8 +3693,11 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
     when that is where it left off), closing any leaked run first."""
+    from hermes_cli.kanban_db_external import require_local_task
+    require_local_task(conn, task_id)
     now = int(time.time())
     with write_txn(conn):
+        require_local_task(conn, task_id)
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if _task_status(conn, task_id) == "blocked"
@@ -3690,8 +3742,11 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     comments; restores the implementer from the ``review_requested`` event.
     Preserves ``consecutive_failures`` and the block loop counter (review is
     not a block; only :func:`complete_task` clears them)."""
+    from hermes_cli.kanban_db_external import require_local_task
+    require_local_task(conn, task_id)
     now = int(time.time())
     with write_txn(conn):
+        require_local_task(conn, task_id)
         _reclaim_dangling_run(
             conn, task_id, statuses=("review",), now=now,
             note="invariant recovery on review reopen",
@@ -3762,6 +3817,8 @@ def invalidate_descendants_for_parent_reopen(
             (task_id,),
         ).fetchall()
         for row in rows:
+            from hermes_cli.kanban_db_external import require_local_task
+            require_local_task(conn, row["id"])
             previous_status = row["status"]
             if previous_status not in {"ready", "review", "running", "done"}:
                 continue
@@ -3824,10 +3881,13 @@ def specify_triage_task(
     txn; False when not in triage. Lands in ``todo`` (not ``ready``) so parent
     gating still applies; the audit comment is written only when a field changed.
     """
+    from hermes_cli.kanban_db_external import require_local_task
+    require_local_task(conn, task_id)
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
+        require_local_task(conn, task_id)
         existing = conn.execute(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),
@@ -3887,7 +3947,10 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
     termination outcome lands as its own ``archive_worker_termination`` event so
     the ``archived`` event stays atomic with the status flip.
     """
+    from hermes_cli.kanban_db_external import require_local_task
+    require_local_task(conn, task_id)
     with write_txn(conn):
+        require_local_task(conn, task_id)
         row = conn.execute(
             "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
             (task_id,),
@@ -3912,6 +3975,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
     if was_running:
         termination = _terminate_reclaimed_worker(prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started)
         with write_txn(conn):
+            require_local_task(conn, task_id)
             _append_event(conn, task_id, "archive_worker_termination", termination, run_id=run_id)
     # ``archived`` parents no longer block children; promote them now.
     recompute_ready(conn)
@@ -3930,7 +3994,10 @@ def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
 def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete an ARCHIVED task (+ related rows); anything else must be
     archived first so data loss takes two deliberate actions."""
+    from hermes_cli.kanban_db_external import require_local_task
+    require_local_task(conn, task_id)
     with write_txn(conn):
+        require_local_task(conn, task_id)
         if _task_status(conn, task_id) != "archived":
             return False
         _delete_task_relations(conn, task_id)
@@ -3940,7 +4007,10 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete a task and its related rows in one txn; False when not found."""
+    from hermes_cli.kanban_db_external import require_local_task
+    require_local_task(conn, task_id)
     with write_txn(conn):
+        require_local_task(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
@@ -3955,7 +4025,10 @@ def schedule_task(
 ) -> bool:
     """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
     until ``unblock_task`` re-gates it."""
+    from hermes_cli.kanban_db_external import require_local_task
+    require_local_task(conn, task_id)
     with write_txn(conn):
+        require_local_task(conn, task_id)
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks

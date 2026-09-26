@@ -71,6 +71,11 @@ def _scrub_local_state(conn: sqlite3.Connection) -> None:
     """Strip machine-local runtime state (claims, PIDs, and above all the
     gateway chat ids subscribed to task events). Caller owns the transaction.
     Run on export and again on import (an archive is untrusted input)."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if "execution_backend" in columns and conn.execute(
+        "SELECT 1 FROM tasks WHERE execution_backend != 'local_profile' LIMIT 1"
+    ).fetchone():
+        raise ValueError("External attempts require coherent controller backup and epoch reconciliation; board transfer refused")
     conn.execute("DELETE FROM kanban_notify_subs")
     conn.execute(
         """
