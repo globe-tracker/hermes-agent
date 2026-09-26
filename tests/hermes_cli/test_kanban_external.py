@@ -255,3 +255,102 @@ def test_external_completion_contract_fails_closed(setup, phase):
             api.review(tid, assignment['attempt_id'], reviewer='independent', evidence='cannot replace acceptance')
     assert kb.get_task(conn, tid).status != 'done'
     assert _durable_state(conn) == before
+
+
+@pytest.mark.parametrize('kind', ['accept', 'start', 'heartbeat', 'progress', 'blocked', 'result'])
+def test_cancel_overtakes_message_without_execution_and_replays_after_restart(setup, kind):
+    import json
+    from concurrent.futures import ThreadPoolExecutor
+    from unittest.mock import patch
+
+    conn, api, key, tid, assignment = setup
+    sequence = 1
+    if kind != 'accept':
+        api.receive(message(api, key, assignment, sequence, 'accept'))
+        sequence += 1
+    if kind not in ('accept', 'start'):
+        api.receive(message(api, key, assignment, sequence, 'start'))
+        sequence += 1
+    payload = {'progress': {'checkpoint': 'progress'}, 'blocked': {'checkpoint': 'blocked'},
+               'result': _result_payload()}.get(kind)
+    pending = message(api, key, assignment, sequence, kind, payload)
+    api.cancel(tid, reason='fixture-stop')
+    # Dependency regression must not prevent rejecting a start/result: no work
+    # is being authorized and the next cancel_ack must remain reachable.
+    parent = kb.create_task(conn, title='unmet fixture dependency', tenant='test-tenant')
+    with kb.write_txn(conn):
+        conn.execute('INSERT INTO task_links(parent_id, child_id) VALUES (?, ?)', (parent, tid))
+    before = _durable_state(conn)
+    with patch.object(api, '_publish', side_effect=OSError('fixture disk full')):
+        with pytest.raises(OSError):
+            api.receive(pending)
+    assert _durable_state(conn) == before
+
+    path = Path(conn.execute('PRAGMA database_list').fetchone()[2])
+    def receive_on_new_connection():
+        fresh = connect(path)
+        try:
+            return ExternalAttempts(fresh, board_id=api.board_id, tenant=api.tenant).receive(pending)
+        finally:
+            fresh.close()
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        receipts = list(workers.map(lambda _: receive_on_new_connection(), range(2)))
+    receipt = receipts[0]
+    assert receipt == receipts[1] == api.receive(pending)
+    assert receipt['outcome'] == 'rejected'
+    assert receipt['rejection_reason'] == receipt['state'] == 'cancel_requested'
+    assert receipt['accepted_kind'] == kind  # Legacy name binds, never authorizes.
+    assert receipt['message_digest'] == hashlib.sha256(canonical(pending['message'])).hexdigest()
+    for field in ('board_id', 'board_epoch', 'tenant', 'task_id', 'task_revision',
+                  'attempt_id', 'agent_id', 'message_id', 'sequence'):
+        assert receipt[field] == pending['message'][field]
+    after = _durable_state(conn)
+    for table in ('tasks', 'task_links', 'task_runs', 'task_comments', 'external_tasks'):
+        assert after[table] == before[table]
+    for table in ('external_receipts', 'external_outbox', 'task_events'):
+        assert len(after[table]) == len(before[table]) + 1
+    attempt = conn.execute('SELECT state, sequence FROM external_attempts WHERE attempt_id=?',
+                           (assignment['attempt_id'],)).fetchone()
+    assert tuple(attempt) == ('cancel_requested', sequence)
+    assert json.loads(api.pending_documents()[-1]['document']) == receipt
+    altered = copy.deepcopy(pending['message'])
+    altered['reported_at'] += 1
+    with pytest.raises(ProtocolError, match='conflicting replay'):
+        api.receive(sign_message(altered, key))
+    assert _durable_state(conn) == after
+    assert kb.claim_task(conn, tid) is None
+    stopped = message(api, key, assignment, sequence + 1, 'cancel_ack', {
+        'checkpoint': 'stopped', 'tools_returned': True, 'in_flight_operations': []})
+    assert api.receive(stopped)['state'] == 'cancelled'
+    assert api.receive(pending) == receipt
+    api.revoke_worker('worker')
+    with pytest.raises(ProtocolError):
+        api.receive(pending)
+
+
+@pytest.mark.parametrize('fault', ['signature', 'revoked', 'expired', 'epoch', 'attempt',
+                                  'revision', 'sequence', 'payload', 'kind', 'conflict', 'held'])
+def test_cancel_rejection_requires_authentication_fences_and_valid_message(setup, fault):
+    conn, api, key, tid, assignment = setup
+    committed = message(api, key, assignment, 1, 'accept')
+    original = api.receive(committed)
+    api.cancel(tid, reason='fixture-stop')
+    assert api.receive(committed) == original
+    overrides = {'epoch': {'board_epoch': 'old'}, 'attempt': {'attempt_id': 'other'},
+                 'revision': {'task_revision': 99}, 'sequence': {'sequence': 3},
+                 'kind': {'kind': 'unknown'}, 'conflict': {'message_id': 'message-1'}}.get(fault, {})
+    pending = message(api, key, assignment, 2, 'start',
+                      {'unexpected': True} if fault == 'payload' else None, **overrides)
+    if fault == 'signature':
+        pending = sign_message(pending['message'], Ed25519PrivateKey.generate())
+    if fault == 'revoked':
+        api.revoke_worker('worker')
+    if fault == 'expired':
+        conn.execute('UPDATE external_workers SET expires_at=?', (int(time.time()) - 1,))
+    if fault == 'held':
+        conn.execute("UPDATE tasks SET external_state='reconciliation_required' WHERE id=?", (tid,))
+    before = _durable_state(conn)
+    assert api.rejection_error is ProtocolError
+    with pytest.raises(api.rejection_error):
+        api.receive(pending)
+    assert _durable_state(conn) == before

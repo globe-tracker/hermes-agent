@@ -163,6 +163,9 @@ class ExternalAttempts:
     correct local DB before giving an instance to a transport adapter. Possession
     of this Python object is operator authority, not a remotely issued capability.
     """
+    # Adapters may quarantine permanent protocol failures, never storage faults.
+    rejection_error = ProtocolError
+
     def __init__(self, conn, *, board_id, tenant):
         self.conn = conn
         self.board_id = identifier(board_id)
@@ -318,7 +321,9 @@ class ExternalAttempts:
         """Atomic signature/revocation check, transition, event, receipt and outbox.
 
         Identical retries return the original durable receipt, not current state.
-        Rejected input is recorded by digest only; raw hostile content is not logged.
+        Cancellation-overtaken valid messages consume sequence with a rejection
+        receipt, never an execution transition. Other rejected input is recorded
+        by digest only; raw hostile content is not logged.
         """
         digest = hashlib.sha256(canonical(envelope)).hexdigest()
         try:
@@ -349,28 +354,35 @@ class ExternalAttempts:
             raise ProtocolError('invalid message kind')
         if task['external_state'] != attempt['state'] or task['execution_backend'] != 'external_agent':
             raise ProtocolError('attempt held for reconciliation')
-        if msg['kind'] in ('start', 'result'):
-            self._check_dependencies(task['id'])
-        state = TRANSITIONS.get((attempt['state'], msg['kind']))
+        # Cancellation may overtake a worker's durably pending message. Consume
+        # only authenticated, fenced, schema-valid next messages; never grant work.
+        cancelled = attempt['state'] == 'cancel_requested' and msg['kind'] in (
+            'accept', 'start', 'heartbeat', 'progress', 'blocked', 'result')
+        state = 'cancel_requested' if cancelled else TRANSITIONS.get((attempt['state'], msg['kind']))
         if state is None or msg['sequence'] != attempt['sequence'] + 1:
             raise ProtocolError('invalid transition or sequence')
         self._validate_payload(msg['kind'], msg['payload'])
+        if not cancelled and msg['kind'] in ('start', 'result'):
+            self._check_dependencies(task['id'])
         self.conn.execute('UPDATE external_attempts SET state=?, sequence=? WHERE attempt_id=?',
                           (state, msg['sequence'], msg['attempt_id']))
         now = int(time.time())
-        self.conn.execute('UPDATE tasks SET status=?, external_state=?, last_heartbeat_at=? WHERE id=?',
-                          (TASK_STATUS.get(state, 'blocked'), state, now, task['id']))
-        if msg['kind'] == 'start':
-            self.conn.execute('UPDATE tasks SET started_at=COALESCE(started_at,?) WHERE id=?', (now, task['id']))
-        if msg['kind'] == 'result':
-            self.conn.execute('UPDATE tasks SET result=? WHERE id=?', (canonical(msg['payload']).decode(), task['id']))
+        if not cancelled:
+            self.conn.execute('UPDATE tasks SET status=?, external_state=?, last_heartbeat_at=? WHERE id=?',
+                              (TASK_STATUS.get(state, 'blocked'), state, now, task['id']))
+            if msg['kind'] == 'start':
+                self.conn.execute('UPDATE tasks SET started_at=COALESCE(started_at,?) WHERE id=?', (now, task['id']))
+            if msg['kind'] == 'result':
+                self.conn.execute('UPDATE tasks SET result=? WHERE id=?', (canonical(msg['payload']).decode(), task['id']))
         receipt = {**{k: msg[k] for k in ('protocol_version', 'board_id', 'board_epoch', 'tenant', 'task_id', 'task_revision', 'attempt_id', 'agent_id', 'message_id', 'sequence')},
                    'kind': 'receipt', 'accepted_kind': msg['kind'], 'state': state, 'received_at': now,
                    'message_digest': hashlib.sha256(canonical(msg)).hexdigest()}
+        if cancelled:
+            receipt.update(outcome='rejected', rejection_reason='cancel_requested')
         self.conn.execute('INSERT INTO external_receipts VALUES (?, ?, ?, ?, ?, ?)',
                           (self.tenant, msg['message_id'], msg['attempt_id'], digest,
                            canonical(receipt).decode(), canonical(msg).decode()))
-        self._event(task['id'], 'external_' + msg['kind'], receipt)
+        self._event(task['id'], 'external_message_rejected' if cancelled else 'external_' + msg['kind'], receipt)
         self._publish('receipt:' + self.tenant + ':' + msg['message_id'], receipt)
         return receipt
 

@@ -53,12 +53,52 @@ rejects PR/repository contracts rather than substituting reviewer prose for the
 native PR acceptance gate. `review` also rejects these contracts on tasks prepared
 by older versions, leaving task/attempt ownership unchanged for reconciliation.
 
+## Cancellation racing with pending messages
+
+If cancellation commits first, a valid next-sequence `accept`, `start`,
+`heartbeat`, `progress`, `blocked` or `result` is consumed atomically with a
+receipt/outbox entry and an `external_message_rejected` event. The receipt has
+`outcome=rejected`, `rejection_reason=cancel_requested`, and
+`state=cancel_requested`. All existing identity/sequence bindings and the SHA-256
+`message_digest` of the canonical original message remain mandatory. The legacy
+`accepted_kind` field binds the original kind; it is **not** an authorization.
+
+This path changes only the attempt sequence, not task execution state, start time,
+heartbeat, result or dependencies. Payload validation still applies. Execution
+prerequisites do not block this rejection: no start or completion is authorized.
+The worker must authenticate the controller receipt, match its exact pending
+message and clear that pending message before sending `cancel_ack` at the next
+sequence. A rejection receipt must never grant start permission or prove shutdown.
+
+Authentication, revocation/expiry, epoch/tenant/task/attempt fences, state coherence,
+next sequence and schema validity are prerequisites. Invalid inputs still raise
+`ProtocolError` without consuming sequence or emitting a reconciliation receipt.
+`ExternalAttempts.rejection_error` exposes that exact exception class to adapters;
+operational/storage failures are not permanent rejections and must remain retryable.
+
+If the worker message committed first, exact retry returns its original accepted
+receipt (the absence of `outcome` retains the v1 accepted meaning), not a later
+rejection. A committed result remains in Review and cannot be overwritten by
+cancellation. Rejected receipts likewise replay unchanged after reconnect, later
+`cancel_ack`, or uncertain delivery, provided current identity/fences still pass.
+Revocation/expiry rejects even previously committed receipts. Receipt/outbox failure
+rolls back sequence, event and receipt together; no blind pending-message discard
+or automatic ownership release is permitted.
+
 ## Verification
 
-Run the repository test runner against `tests/hermes_cli/test_kanban_external.py`.
-The tests use generated keys and temporary native databases, cover auth/replay,
+```sh
+scripts/run_tests.sh tests/hermes_cli/test_kanban_external.py -j 1
+scripts/run_tests.sh tests/hermes_cli/test_kanban*.py tests/plugins/test_kanban*.py tests/tools/test_kanban*.py -j 4
+```
+
+Use the repository's isolated runner, never a safety-environment bypass. The tests
+use generated keys and temporary native databases, cover auth/replay,
 revocation/expiry, tenant/home isolation, local-dispatch exclusion, cancellation,
-fencing, rollback and concurrent duplicate receipt serialization. The broader
+fencing, rollback and concurrent duplicate receipt serialization. Cancellation
+coverage includes each overtaken kind, no execution mutation, dependency drift,
+reconnect/duplicate replay, publication failure rollback, next-sequence stop
+acknowledgement and negative authentication/schema/fence cases. The broader
 Kanban suite also exercises legacy migrations and local execution compatibility.
 
 ## Remaining acceptance gates
