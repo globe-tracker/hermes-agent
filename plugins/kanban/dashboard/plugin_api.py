@@ -647,6 +647,8 @@ def _patch_title_body(conn, task_id: str, payload: UpdateTaskBody, board: Option
     """PATCH title/body phase: one UPDATE + ``edited`` event, then the post-commit observer
     (field names only — values never leave the DB via this payload)."""
     with kanban_db.write_txn(conn):
+        from hermes_cli.kanban_db_external import require_local_task
+        require_local_task(conn, task_id)
         sets, vals = [], []
         if payload.title is not None:
             if not payload.title.strip():
@@ -720,6 +722,8 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
     terminations: list[tuple[Optional[int], Optional[str], Optional[int]]] = []
     effective_status = new_status
     with kanban_db.write_txn(conn):
+        from hermes_cli.kanban_db_external import require_local_task
+        require_local_task(conn, task_id)
         prev = conn.execute(
             "SELECT status, current_run_id, worker_pid, claim_lock, worker_started_at FROM tasks WHERE id = ?",
             (task_id,)).fetchone()

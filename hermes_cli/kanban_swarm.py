@@ -22,6 +22,7 @@ import time
 from typing import Any, Iterable, Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli.kanban_db_external import require_local_task
 
 BLACKBOARD_PREFIX = "[swarm:blackboard] "
 
@@ -81,6 +82,7 @@ def _activate_root_inline(
     would run while the outer txn can still roll back). The caller runs
     ``recompute_ready`` after the outer commit.
     """
+    require_local_task(conn, root_id)
     cur = conn.execute(
         """
         UPDATE tasks
@@ -91,6 +93,7 @@ def _activate_root_inline(
                worker_pid   = NULL
          WHERE id = ?
            AND status = 'blocked'
+           AND execution_backend = 'local_profile'
         """,
         (int(time.time()), root_id),
     )
@@ -197,6 +200,10 @@ def _create_swarm_uncommitted(
         initial_status="blocked",
         **common,
     )
+
+    # Idempotency is not execution ownership. Refuse before reading/reusing
+    # topology or creating any graph rows, under create_swarm's transaction.
+    require_local_task(conn, root)
 
     # Idempotency may return an existing root: recover its topology from the
     # blackboard instead of duplicating the graph.

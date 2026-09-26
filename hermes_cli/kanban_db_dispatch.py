@@ -620,8 +620,11 @@ def heartbeat_worker(
     (train loop, crawl) is stuck can still have a live Python process.
     Returns False if the task is not running or its claim expired.
     """
+    from hermes_cli.kanban_db_external import require_local_task
+    require_local_task(conn, task_id)
     now = int(time.time())
     with _kb.write_txn(conn):
+        require_local_task(conn, task_id)
         sql = "UPDATE tasks SET last_heartbeat_at = ? WHERE id = ? AND status = 'running'"
         params: tuple = (now, task_id)
         if expected_run_id is not None:
@@ -663,7 +666,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
+        "WHERE t.execution_backend = 'local_profile' AND t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
         "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
         "  AND t.worker_pid IS NOT NULL"
     ).fetchall()
@@ -772,7 +775,7 @@ def detect_stale_running(
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.status = 'running'"
+        "WHERE t.execution_backend = 'local_profile' AND t.status = 'running'"
     ).fetchall()
 
     for row in rows:
@@ -856,7 +859,7 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
     reconciled: list[str] = []
     rows = conn.execute(
         "SELECT id, claim_lock, claim_expires, worker_pid, worker_started_at FROM tasks "
-        "WHERE status = 'running' "
+        "WHERE execution_backend = 'local_profile' AND status = 'running' "
         "  AND (claim_lock IS NULL OR claim_expires IS NULL)"
     ).fetchall()
     for row in rows:
@@ -1141,7 +1144,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
         rows = conn.execute(
             "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee "
             "FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
+            "WHERE execution_backend = 'local_profile' AND status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = _kb._host_prefix()
         for row in rows:
@@ -1364,10 +1367,13 @@ def _record_task_failure(
     the breaker never trips; the card stays retryable and
     :func:`check_respawn_guard` spaces the retries.
     """
+    from hermes_cli.kanban_db_external import require_local_task
+    require_local_task(conn, task_id)
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     error = error[:500]
     with _kb.write_txn(conn):
+        require_local_task(conn, task_id)
         row = conn.execute(
             "SELECT consecutive_failures, status, max_retries, current_run_id "
             "FROM tasks WHERE id = ?", (task_id,),
@@ -1462,8 +1468,11 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     decision tell OUR worker from a process that recycled the PID after a reboot. A failed capture is
     persisted as ``UNVERIFIED_WORKER_FINGERPRINT``, never NULL: NULL is the legacy pre-fingerprint row
     whose bare-PID kill authority a new spawn must not inherit."""
+    from hermes_cli.kanban_db_external import require_local_task
+    require_local_task(conn, task_id)
     started_at = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
     with _kb.write_txn(conn):
+        require_local_task(conn, task_id)
         conn.execute("UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
                      (int(pid), started_at, task_id))
         run_id = _kb._current_run_id(conn, task_id)
@@ -1480,7 +1489,10 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
     spawn proves the worker could start, not that the run will succeed, so
     timeouts and crashes must accumulate across spawn boundaries.
     """
+    from hermes_cli.kanban_db_external import require_local_task
+    require_local_task(conn, task_id)
     with _kb.write_txn(conn):
+        require_local_task(conn, task_id)
         conn.execute(
             "UPDATE tasks SET consecutive_failures = 0, "
             "last_failure_error = NULL WHERE id = ?",
@@ -1853,7 +1865,7 @@ def count_running_tasks(conn: sqlite3.Connection) -> int:
     try:
         return int(
             conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+                "SELECT COUNT(*) FROM tasks WHERE execution_backend = 'local_profile' AND status = 'running'"
             ).fetchone()[0]
         )
     except Exception:
@@ -2111,10 +2123,13 @@ def _apply_default_assignee(
     by the default, not "unassigned but secretly routed". ``dry_run`` reports
     without writing. Returns False when the write failed.
     """
+    from hermes_cli.kanban_db_external import require_local_task
+    require_local_task(conn, task_id)
     if dry_run:
         return True
     try:
         with _kb.write_txn(conn):
+            require_local_task(conn, task_id)
             conn.execute(
                 "UPDATE tasks SET assignee = ? WHERE id = ? "
                 "AND (assignee IS NULL OR assignee = '')",
@@ -2248,6 +2263,8 @@ def _any_spawnable_review(
     profile_exists = _profile_exists_fn()
     running = per_profile_running or {}
     for row in review_rows:
+        if _kb.get_task(conn, row['id']).execution_backend != 'local_profile':
+            continue
         assignee = row["assignee"]
         if not assignee:
             continue
@@ -2329,7 +2346,7 @@ def _dispatch_once_locked(
     if per_profile_cap is not None:
         for prow in conn.execute(
             "SELECT assignee, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND assignee IS NOT NULL "
+            "WHERE execution_backend = 'local_profile' AND status = 'running' AND assignee IS NOT NULL "
             "GROUP BY assignee"
         ):
             per_profile_running[prow["assignee"]] = int(prow["n"])
@@ -2351,6 +2368,9 @@ def _dispatch_once_locked(
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
     for row in ready_rows:
+        if _kb.get_task(conn, row['id']).execution_backend != 'local_profile':
+            result.skipped_nonspawnable.append(row['id'])
+            continue
         if ready_budget is not None and spawned >= ready_budget:
             break
         row_assignee = row["assignee"]
@@ -2372,6 +2392,8 @@ def _dispatch_once_locked(
     # checks the FULL shared ``spawn_budget`` — the reservation above caps the
     # ready lane, it grants no extra capacity here.
     for row in review_rows:
+        if _kb.get_task(conn, row['id']).execution_backend != 'local_profile':
+            continue
         if spawn_budget is not None and spawned >= spawn_budget:
             break
         if not row["assignee"]:
@@ -2767,6 +2789,8 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` / workspaces_root to the
     board the task was claimed from, so workers cannot see other boards.
     """
+    if task.execution_backend != 'local_profile':
+        raise ValueError('external tasks cannot spawn local workers')
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
 
